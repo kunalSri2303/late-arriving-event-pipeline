@@ -11,6 +11,7 @@ from src.ingest import ingest_events
 from src.aggregate import update_daily_aggregates
 from src.reconcile import reconcile_pipeline
 from src.ai_summary import generate_ai_run_summary
+from src.demo import run_demonstration
 
 
 def run_pipeline(csv_path=None, db_path=None, init_db=False) -> dict:
@@ -131,7 +132,17 @@ if __name__ == "__main__":
     parser.add_argument("--csv", help="Path to input CSV file", default=None)
     parser.add_argument("--db", help="Path to SQLite database", default=None)
     parser.add_argument("--init", help="Force database schema initialization", action="store_true")
+    parser.add_argument("--demo", help="Run the historical correction demonstration", action="store_true")
+    parser.add_argument("--reconcile", help="Run standalone data reconciliation check", action="store_true")
     args = parser.parse_args()
+
+    if args.demo:
+        run_demonstration()
+        sys.exit(0)
+
+    if args.reconcile:
+        rec = reconcile_pipeline(db_path=args.db)
+        sys.exit(0 if rec.get("reconciled", False) else 1)
 
     result = run_pipeline(csv_path=args.csv, db_path=args.db, init_db=args.init)
     if not result.get("success", False):

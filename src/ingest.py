@@ -62,6 +62,12 @@ def ingest_events(
             )
             """
         )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_raw_events_event_date
+            ON raw_events(event_date)
+            """
+        )
 
         with target_csv.open("r", newline="", encoding="utf-8") as file:
             reader = csv.DictReader(file)

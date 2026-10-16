@@ -46,9 +46,10 @@ Late events are inserted into `raw_events` under their original historical `even
 ---
 
 ## 6. Transaction Safety & Failure Recovery
-- **ACID Transactions**: Aggregation updates execute within an atomic transaction (`BEGIN ... COMMIT / ROLLBACK`).
+- **ACID Transactions**: Aggregation updates execute within an atomic transaction managed by Python's `with conn:` context manager (auto-commit on success, automatic rollback on exception).
 - **Fail-Fast Stage Gating**: The orchestrator (`src/main.py`) validates prerequisites at each stage (Init → Ingest → Aggregate → Reconcile). A failure in an upstream stage immediately aborts downstream stages (`SKIPPED`) and exits with status `1`.
 - **Safe Recovery**: If aggregation fails mid-batch, the transaction rolls back cleanly. Rerunning `src/main.py` recalculates aggregates fresh from `raw_events` without data loss or duplicate records.
+- **Isolated AI Layer**: Operational summary generation is isolated behind a clear interface in `src/ai_summary.py`. It falls back gracefully to deterministic metrics when AI credentials or endpoints are unavailable, ensuring zero network failures can halt pipeline execution.
 
 ---
 
@@ -56,3 +57,4 @@ Late events are inserted into `raw_events` under their original historical `even
 - **SQLite Single-Writer Lock**: SQLite provides lightweight, zero-dependency persistence ideal for embedded and assessment pipelines. For high-throughput concurrent writers, PostgreSQL or distributed engines would replace SQLite.
 - **Full Date Re-aggregation**: Recalculating affected dates guarantees 100% mathematical consistency at the cost of O(N) reads per affected date. For high-volume partitions, incremental delta trees or micro-batch watermarks could be introduced.
 - **In-Memory Assumptions**: Timestamps assume standard ISO-8601 formatting, converted to naive UTC/local timestamps.
+- **Deferred Video**: The 5–8 minute demonstration video recording is intentionally deferred; all demonstration steps and talking points are fully documented in `docs/demo_video_script.md`.

@@ -1,0 +1,9 @@
+# Bytespoke DAI-040: Late-Arriving Event Pipeline
+#
+# Core Pipeline Runtime:
+# The core pipeline (src/) relies exclusively on the Python Standard Library
+# (sqlite3, csv, datetime, pathlib, argparse, urllib, json, unittest).
+# No external third-party dependencies are required to run the pipeline.
+#
+# Development & Testing (Optional):
+pytest>=8.0.0

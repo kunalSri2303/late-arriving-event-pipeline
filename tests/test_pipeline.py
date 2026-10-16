@@ -17,6 +17,7 @@ from src.ingest import ingest_events
 from src.aggregate import update_daily_aggregates
 from src.reconcile import reconcile_pipeline
 from src.main import run_pipeline
+from src.ai_summary import generate_ai_run_summary, AISummarizerInterface
 
 
 class TestLateArrivingEventPipeline(unittest.TestCase):
@@ -342,6 +343,204 @@ class TestLateArrivingEventPipeline(unittest.TestCase):
 
         self.assertEqual(raw_cnt, raw_cnt_after)
         self.assertEqual(agg_rows, agg_rows_after)
+
+    # --- PHASE D EXTENDED VERIFICATION TESTS ---
+
+    def test_out_of_order_event_processing(self):
+        """Verify that records arriving out of chronological order are assigned correctly."""
+        # Record 1 has event_time on 2026-10-11
+        # Record 2 has event_time on 2026-10-10 (arrives chronologically after Day 2 record)
+        rows = [
+            ["evt_901", "2026-10-11T10:00:00", "2026-10-11T10:05:00", "700.0"],
+            ["evt_902", "2026-10-10T12:00:00", "2026-10-11T10:10:00", "300.0"],
+        ]
+        self._write_csv(rows)
+        summary = ingest_events(csv_path=self.csv_path, db_path=self.db_path)
+
+        # evt_902 should be flagged late because event_time is prior to max committed event_time
+        self.assertEqual(summary["inserted"], 2)
+        self.assertEqual(summary["late"], 1)
+
+        # Aggregation should partition records strictly by their event_date
+        update_daily_aggregates(db_path=self.db_path)
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            oct10 = conn.execute(
+                "SELECT total_orders, total_amount FROM daily_aggregates WHERE event_date = '2026-10-10'"
+            ).fetchone()
+            oct11 = conn.execute(
+                "SELECT total_orders, total_amount FROM daily_aggregates WHERE event_date = '2026-10-11'"
+            ).fetchone()
+
+            self.assertEqual(oct10[0], 1)
+            self.assertEqual(oct10[1], 300.0)
+            self.assertEqual(oct11[0], 1)
+            self.assertEqual(oct11[1], 700.0)
+        finally:
+            conn.close()
+
+    def test_late_arriving_event_watermark_threshold(self):
+        """Verify watermark threshold correctly identifies late arrival on the same date."""
+        # Event occurred at 10:00 but arrived at 12:00 (lag = 7200 seconds)
+        rows = [
+            ["evt_903", "2026-10-10T10:00:00", "2026-10-10T12:00:00", "400.0"]
+        ]
+        self._write_csv(rows)
+        # Threshold = 3600 seconds (1 hour); 7200 > 3600 -> late
+        summary = ingest_events(
+            csv_path=self.csv_path,
+            db_path=self.db_path,
+            late_threshold_seconds=3600,
+        )
+        self.assertEqual(summary["late"], 1)
+
+    def test_before_after_aggregate_delta_verification(self):
+        """Demonstrate and verify initial aggregate, late event arrival, and numerical delta."""
+        # Initial baseline batch (Oct 10: 2 orders $1100, Oct 11: 1 order $1000)
+        initial_rows = [
+            ["evt_001", "2026-10-10T09:00:00", "2026-10-10T09:05:00", "500.0"],
+            ["evt_002", "2026-10-10T10:30:00", "2026-10-10T10:35:00", "600.0"],
+            ["evt_003", "2026-10-11T08:00:00", "2026-10-11T08:05:00", "1000.0"],
+        ]
+        self._write_csv(initial_rows)
+        ingest_events(csv_path=self.csv_path, db_path=self.db_path)
+        update_daily_aggregates(db_path=self.db_path)
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            oct10_before = conn.execute(
+                "SELECT total_orders, total_amount FROM daily_aggregates WHERE event_date = '2026-10-10'"
+            ).fetchone()
+            oct11_before = conn.execute(
+                "SELECT total_orders, total_amount FROM daily_aggregates WHERE event_date = '2026-10-11'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(oct10_before[0], 2)
+        self.assertEqual(oct10_before[1], 1100.0)
+        self.assertEqual(oct11_before[0], 1)
+        self.assertEqual(oct11_before[1], 1000.0)
+
+        # Now late event arrives on Oct 11 for Oct 10
+        late_rows = [
+            ["evt_004", "2026-10-10T14:00:00", "2026-10-11T09:00:00", "500.0"]
+        ]
+        self._write_csv(late_rows)
+        summary = ingest_events(csv_path=self.csv_path, db_path=self.db_path)
+        self.assertEqual(summary["late"], 1)
+
+        update_daily_aggregates(db_path=self.db_path)
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            oct10_after = conn.execute(
+                "SELECT total_orders, total_amount FROM daily_aggregates WHERE event_date = '2026-10-10'"
+            ).fetchone()
+            oct11_after = conn.execute(
+                "SELECT total_orders, total_amount FROM daily_aggregates WHERE event_date = '2026-10-11'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        # Quantified delta verification
+        delta_orders = oct10_after[0] - oct10_before[0]
+        delta_amount = oct10_after[1] - oct10_before[1]
+
+        self.assertEqual(delta_orders, 1)
+        self.assertEqual(delta_amount, 500.0)
+        self.assertEqual(oct10_after[0], 3)
+        self.assertEqual(oct10_after[1], 1600.0)
+        # Verify Oct 11 remained completely unaffected
+        self.assertEqual(oct11_after[0], oct11_before[0])
+        self.assertEqual(oct11_after[1], oct11_before[1])
+
+    def test_reconciliation_success(self):
+        """Verify that accurate data passes reconciliation check."""
+        sample_csv = ROOT_DIR / "data" / "sample_events.csv"
+        run_pipeline(csv_path=sample_csv, db_path=self.db_path)
+
+        result = reconcile_pipeline(db_path=self.db_path)
+        self.assertTrue(result["reconciled"])
+        self.assertEqual(len(result["discrepancies"]), 0)
+
+    def test_reconciliation_missing_tables(self):
+        """Verify reconciliation handles missing tables safely without crashing."""
+        empty_db = Path(self.temp_dir.name) / "uninitialized.db"
+        result = reconcile_pipeline(db_path=empty_db)
+        self.assertFalse(result["reconciled"])
+        self.assertTrue(any("Missing required database tables" in d for d in result["discrepancies"]))
+
+    def test_ai_summary_isolated_interface_default_fallback(self):
+        """Verify operational summary works reliably without external AI services or credentials."""
+        sample_csv = ROOT_DIR / "data" / "sample_events.csv"
+        result = run_pipeline(csv_path=sample_csv, db_path=self.db_path)
+        summary = result["summary_text"]
+
+        self.assertIn("=== Operational Pipeline Run Summary ===", summary)
+        self.assertIn("• Overall Status:         SUCCESS", summary)
+        self.assertNotIn("• AI Operational Commentary:", summary)
+
+    def test_ai_summary_with_mock_llm_provider(self):
+        """Verify AI interface enriches output without modifying database records."""
+        mock_summarizer = AISummarizerInterface()
+        mock_summarizer.is_configured = lambda: True
+        mock_summarizer.generate_commentary = lambda ctx: "All batches reconciled successfully with zero errors."
+
+        summary = generate_ai_run_summary(
+            ingest_summary={"read": 5, "inserted": 4, "duplicate": 1, "conflicting_duplicates": 0, "invalid": 0, "late": 1, "affected_dates": ["2026-10-10"]},
+            agg_results=[["2026-10-10", 3, 1600.0]],
+            reconciliation={"reconciled": True},
+            ai_interface=mock_summarizer,
+        )
+
+        self.assertIn("• AI Operational Commentary:", summary)
+        self.assertIn("All batches reconciled successfully with zero errors.", summary)
+
+    def test_ai_summary_graceful_error_handling(self):
+        """Verify that when AI service encounters an error, it falls back cleanly to deterministic summary."""
+        mock_summarizer = AISummarizerInterface()
+        mock_summarizer.is_configured = lambda: True
+        # Simulate network error in generate_commentary
+        mock_summarizer.generate_commentary = lambda ctx: None
+
+        summary = generate_ai_run_summary(
+            ingest_summary={"read": 1, "inserted": 1, "duplicate": 0, "conflicting_duplicates": 0, "invalid": 0, "late": 0, "affected_dates": ["2026-10-10"]},
+            agg_results=[["2026-10-10", 1, 500.0]],
+            reconciliation={"reconciled": True},
+            ai_interface=mock_summarizer,
+        )
+
+        self.assertIn("=== Operational Pipeline Run Summary ===", summary)
+        self.assertNotIn("• AI Operational Commentary:", summary)
+
+    def test_database_isolation_and_transaction_safety(self):
+        """Verify transaction rollback during aggregation prevents partial database state."""
+        rows = [["evt_701", "2026-10-10T10:00:00", "2026-10-10T10:05:00", "250.0"]]
+        self._write_csv(rows)
+        ingest_events(csv_path=self.csv_path, db_path=self.db_path)
+
+        # Create a temporary trigger on daily_aggregates that aborts insert to simulate failure
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "CREATE TRIGGER fail_agg BEFORE INSERT ON daily_aggregates "
+            "BEGIN SELECT RAISE(ABORT, 'Simulated DB Aggregation Failure'); END;"
+        )
+        conn.close()
+
+        with self.assertRaises(sqlite3.DatabaseError):
+            update_daily_aggregates(db_path=self.db_path)
+
+        # Verify raw_events remains intact and daily_aggregates was rolled back
+        conn = sqlite3.connect(self.db_path)
+        try:
+            raw_cnt = conn.execute("SELECT COUNT(*) FROM raw_events").fetchone()[0]
+            agg_cnt = conn.execute("SELECT COUNT(*) FROM daily_aggregates").fetchone()[0]
+            self.assertEqual(raw_cnt, 1)
+            self.assertEqual(agg_cnt, 0)
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

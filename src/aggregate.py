@@ -43,8 +43,7 @@ def update_daily_aggregates(db_path=None, affected_dates=None) -> list:
 
         daily_results = conn.execute(query, params).fetchall()
 
-        conn.execute("BEGIN")
-        try:
+        with conn:
             for event_date, total_orders, total_amount in daily_results:
                 conn.execute(
                     """
@@ -62,10 +61,6 @@ def update_daily_aggregates(db_path=None, affected_dates=None) -> list:
                     """,
                     (event_date, total_orders, round(total_amount, 2), now),
                 )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
     finally:
         conn.close()
 

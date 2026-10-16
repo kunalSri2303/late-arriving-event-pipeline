@@ -11,6 +11,22 @@ def reconcile_pipeline(db_path=None) -> dict:
 
     conn = sqlite3.connect(target_db)
     try:
+        tables = [
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        ]
+        if "raw_events" not in tables or "daily_aggregates" not in tables:
+            missing = [t for t in ["raw_events", "daily_aggregates"] if t not in tables]
+            print(f"ERROR: Missing database tables: {missing}")
+            return {
+                "reconciled": False,
+                "discrepancies": [f"Missing required database tables: {missing}"],
+                "raw_metrics": {},
+                "agg_metrics": {},
+            }
+
         raw_metrics = dict()
         for row in conn.execute(
             """
